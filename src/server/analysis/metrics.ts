@@ -104,14 +104,21 @@ export function evaluateMetrics(input: {
     }
     const ranges = [...blame.ranges].sort((a, b) => a.startLine - b.startLine);
     let complete = true;
+    let rangeIndex = 0;
     const selectedOids: string[] = [];
     for (const occurrence of selected) {
-      const range = ranges.find(
-        (candidate) =>
-          candidate.startLine <= occurrence.lineNumber &&
-          candidate.endLine >= occurrence.lineNumber,
-      );
-      if (!range) {
+      while (
+        rangeIndex < ranges.length &&
+        ranges[rangeIndex]!.endLine < occurrence.lineNumber
+      ) {
+        rangeIndex += 1;
+      }
+      const range = ranges[rangeIndex];
+      if (
+        !range ||
+        range.startLine > occurrence.lineNumber ||
+        range.endLine < occurrence.lineNumber
+      ) {
         complete = false;
         break;
       }

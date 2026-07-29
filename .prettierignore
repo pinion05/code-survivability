@@ -3,9 +3,6 @@ dist
 .astro
 .git
 .gjc
-.env
-.env.*
-!.env.example
 coverage
 playwright-report
 test-results

@@ -44,6 +44,19 @@ describe("admission limits", () => {
     expect(limiter.consume("client", 2, 2)).toBe(true);
   });
 
+  test("bounds attacker-controlled bucket keys and expires inactive entries", () => {
+    let now = 0;
+    const limiter = new TokenBucketLimiter(() => now, 3, 1_000);
+    for (const key of ["a", "b", "c", "d", "e"]) {
+      expect(limiter.consume(key, 1, 1)).toBe(true);
+    }
+    expect(limiter.size).toBe(3);
+
+    now = 1_001;
+    expect(limiter.consume("fresh", 1, 1)).toBe(true);
+    expect(limiter.size).toBe(1);
+  });
+
   test("enforces client creation and poll bursts", () => {
     const admission = new AdmissionController(() => 0);
     admission.admitCreation("client-a");
@@ -51,8 +64,8 @@ describe("admission limits", () => {
     expect(() => admission.admitCreation("client-a")).toThrow(AppError);
 
     for (let index = 0; index < 6; index += 1) {
-      admission.admitPoll("client-a", "job-a");
+      admission.admitPoll("client-a");
     }
-    expect(() => admission.admitPoll("client-a", "job-a")).toThrow(AppError);
+    expect(() => admission.admitPoll("client-a")).toThrow(AppError);
   });
 });

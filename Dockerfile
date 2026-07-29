@@ -6,7 +6,7 @@ COPY . .
 RUN bun run build
 
 FROM node:22-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates util-linux && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production HOST=0.0.0.0 PORT=4321
 COPY --from=build /app/package.json /app/bun.lock ./

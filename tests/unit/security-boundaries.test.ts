@@ -1,6 +1,13 @@
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { validateUsername } from "../../src/server/github/canonical-user";
-import { parseBatchBlobs, parseTree } from "../../src/server/git/scanner";
+import {
+  cleanupJobWorkspaces,
+  parseBatchBlobs,
+  parseTree,
+} from "../../src/server/git/scanner";
 import { spawnBounded } from "../../src/server/git/spawn";
 import { readBoundedJson } from "../../src/server/schemas/api";
 import { LIMITS } from "../../src/server/schemas/limits";
@@ -83,6 +90,29 @@ describe("untrusted input boundaries", () => {
     ).toThrow("Git blob batch 본문이 잘렸습니다");
   });
 
+  test("removes exact and stale worker-owned workspaces without touching peers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "code-survivability-test-"));
+    const firstId = "11111111-1111-4111-8111-111111111111";
+    const secondId = "22222222-2222-4222-8222-222222222222";
+    const first = join(root, `job-${firstId}-aaaaaa`);
+    const second = join(root, `job-${secondId}-bbbbbb`);
+    const unrelated = join(root, "keep");
+    try {
+      await Promise.all([mkdir(first), mkdir(second), mkdir(unrelated)]);
+      await writeFile(join(first, "large-pack"), "evidence");
+
+      await cleanupJobWorkspaces(root, firstId);
+      expect((await readdir(root)).sort()).toEqual([
+        `job-${secondId}-bbbbbb`,
+        "keep",
+      ]);
+
+      await cleanupJobWorkspaces(root);
+      expect(await readdir(root)).toEqual(["keep"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   test("spawns argv without a shell and enforces output bounds", async () => {
     const literal = "; echo injected";
     const safe = await spawnBounded(

@@ -14,7 +14,7 @@ export const GET: APIRoute = async ({ params, request }) => {
   try {
     const id = params.id;
     if (!id || !/^[0-9a-f-]{36}$/i.test(id)) return notFoundResponse();
-    runtime.admission.admitPoll(clientKey(request), id);
+    runtime.admission.admitPoll(clientKey(request));
     const job = runtime.jobs.getJob(id);
     if (!job) return notFoundResponse();
     return noStoreJson({

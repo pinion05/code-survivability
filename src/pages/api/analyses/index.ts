@@ -47,6 +47,7 @@ export const POST: APIRoute = async ({ request }) => {
     const user = await canonicalizeUser(
       new GitHubClient(config.GITHUB_TOKEN),
       username,
+      request.signal,
     );
     const finalized = runtime.jobs.finalizeReservation(
       reservation,

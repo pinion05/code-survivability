@@ -29,6 +29,10 @@ export class GitSnapshotScanner {
   private processCount = 0;
   private totalGitMs = 0;
   private totalBlobBytes = 0;
+  private totalTreeEntries = 0;
+  private totalLines = 0;
+  private totalStoredOccurrences = 0;
+  private totalStoredOccurrenceBytes = 0;
 
   constructor(
     private readonly root: string,
@@ -36,18 +40,54 @@ export class GitSnapshotScanner {
   ) {}
 
   async scan(input: {
+    jobId: string;
     owner: string;
     repo: string;
     defaultBranch: string;
-    requestedPaths: Set<string>;
+    requestedLineCounts: Map<string, Map<string, number>>;
     signal?: AbortSignal;
   }): Promise<SnapshotResult> {
     validateRepositoryName(input.owner);
     validateRepositoryName(input.repo);
     validateBranch(input.defaultBranch);
+    const requestedPaths = new Set(input.requestedLineCounts.keys());
+    const repositoryTargets = new Map<string, string>();
+    let requestedOccurrenceBudget = 0;
+    let requestedOccurrenceBytes = 0;
+    let normalizedEntryBytes = 0;
+    for (const counts of input.requestedLineCounts.values()) {
+      for (const [line, count] of counts) {
+        if (!line || !Number.isSafeInteger(count) || count <= 0) {
+          throw new AppError(
+            "ANALYSIS_FAILED",
+            "요청된 줄 발생 횟수가 올바르지 않습니다",
+          );
+        }
+        const bytes = Buffer.byteLength(line, "utf8");
+        if (!repositoryTargets.has(line)) {
+          repositoryTargets.set(line, line);
+          normalizedEntryBytes += bytes;
+        }
+        requestedOccurrenceBudget += count;
+        requestedOccurrenceBytes += bytes * count;
+      }
+    }
+    if (
+      requestedOccurrenceBudget > LIMITS.storedOccurrences ||
+      requestedOccurrenceBytes > LIMITS.storedOccurrenceBytes ||
+      repositoryTargets.size > LIMITS.normalizedEntriesPerRepository ||
+      normalizedEntryBytes > LIMITS.normalizedEntryBytesPerRepository
+    ) {
+      throw new AppError(
+        "ANALYSIS_FAILED",
+        "요청된 줄 증거 한도를 초과했습니다",
+      );
+    }
     await mkdir(this.root, { recursive: true, mode: 0o700 });
     await this.preflight();
-    const workspace = await mkdtemp(join(this.root, "job-"));
+    const workspace = await mkdtemp(
+      join(this.root, jobWorkspacePrefix(input.jobId)),
+    );
     const bare = join(workspace, "repository.git");
     const home = join(workspace, "home");
     const hooks = join(workspace, "hooks");
@@ -162,6 +202,14 @@ export class GitSnapshotScanner {
           "저장소 트리 항목 한도를 초과했습니다",
         );
       }
+      this.totalTreeEntries += entries.length;
+      if (this.totalTreeEntries > LIMITS.treeEntries) {
+        throw new AppError(
+          "ANALYSIS_FAILED",
+          "분석 전체 트리 항목 한도를 초과했습니다",
+        );
+      }
+      const entryPaths = new Set(entries.map((entry) => entry.path));
       const currentPaths = new Map<string, CurrentPath>();
       const unavailableOriginalPaths = new Set<string>();
       const repositoryCounts = new Map<string, number>();
@@ -179,7 +227,7 @@ export class GitSnapshotScanner {
 
       for (const entry of entries) {
         if (!isEligiblePath(entry.path)) continue;
-        const requested = input.requestedPaths.has(entry.path);
+        const requested = requestedPaths.has(entry.path);
         if (blobCount >= LIMITS.blobsPerRepository) {
           repositoryComplete = false;
           addCoverageReason("BLOB_COUNT_LIMIT");
@@ -207,45 +255,122 @@ export class GitSnapshotScanner {
         selectedEntries.push(entry);
       }
 
-      const blobs = await this.readBlobs(
-        workspace,
-        bare,
-        env,
-        baseArgs,
-        selectedEntries,
-        input.signal,
-      );
-      for (const entry of selectedEntries) {
-        const requested = input.requestedPaths.has(entry.path);
-        const blob = blobs.get(entry.oid);
-        if (!blob) {
-          repositoryComplete = false;
-          addCoverageReason("BLOB_UNAVAILABLE");
-          if (requested) unavailableOriginalPaths.add(entry.path);
-          continue;
+      let repositoryLines = 0;
+      let stopRepository = false;
+      const markRequestedUnavailable = (): void => {
+        for (const path of requestedPaths) unavailableOriginalPaths.add(path);
+      };
+      for (const batch of partitionBlobEntries(selectedEntries)) {
+        if (stopRepository) break;
+        const blobs = await this.readBlobs(
+          workspace,
+          bare,
+          env,
+          baseArgs,
+          batch,
+          input.signal,
+        );
+        for (const entry of batch) {
+          const requestedCounts = input.requestedLineCounts.get(entry.path);
+          const requested = requestedCounts !== undefined;
+          const blob = blobs.get(entry.oid);
+          if (!blob) {
+            repositoryComplete = false;
+            addCoverageReason("BLOB_UNAVAILABLE");
+            if (requested) unavailableOriginalPaths.add(entry.path);
+            continue;
+          }
+          let text: string;
+          try {
+            text = new TextDecoder("utf-8", { fatal: true }).decode(blob);
+          } catch {
+            repositoryComplete = false;
+            addCoverageReason("BLOB_ENCODING_UNAVAILABLE");
+            if (requested) unavailableOriginalPaths.add(entry.path);
+            continue;
+          }
+          const lines = text.split("\n");
+          if (lines.length > LIMITS.linesPerBlob) {
+            repositoryComplete = false;
+            addCoverageReason("BLOB_LINE_LIMIT");
+            if (requested) unavailableOriginalPaths.add(entry.path);
+            continue;
+          }
+          if (repositoryLines + lines.length > LIMITS.linesPerRepository) {
+            repositoryComplete = false;
+            addCoverageReason("REPOSITORY_LINE_LIMIT");
+            markRequestedUnavailable();
+            stopRepository = true;
+            break;
+          }
+          if (this.totalLines + lines.length > LIMITS.linesTotal) {
+            repositoryComplete = false;
+            addCoverageReason("ANALYSIS_LINE_LIMIT");
+            markRequestedUnavailable();
+            stopRepository = true;
+            break;
+          }
+          repositoryLines += lines.length;
+          this.totalLines += lines.length;
+
+          const occurrences: CurrentPath["occurrences"] = [];
+          const collected = new Map<string, number>();
+          for (let index = 0; index < lines.length; index += 1) {
+            const line = normalizeLine(lines[index] ?? "");
+            if (!line) continue;
+            const canonicalLine = repositoryTargets.get(line);
+            if (canonicalLine !== undefined) {
+              if (
+                repositoryCounts.has(canonicalLine) ||
+                repositoryCounts.size < LIMITS.normalizedEntriesPerRepository
+              ) {
+                repositoryCounts.set(
+                  canonicalLine,
+                  (repositoryCounts.get(canonicalLine) ?? 0) + 1,
+                );
+              } else {
+                repositoryComplete = false;
+                addCoverageReason("NORMALIZED_ENTRY_LIMIT");
+              }
+            }
+
+            const expected =
+              canonicalLine === undefined
+                ? 0
+                : (requestedCounts?.get(canonicalLine) ?? 0);
+            const retained =
+              canonicalLine === undefined
+                ? 0
+                : (collected.get(canonicalLine) ?? 0);
+            if (expected <= retained) continue;
+            const occurrenceBytes = Buffer.byteLength(
+              canonicalLine ?? line,
+              "utf8",
+            );
+            if (
+              this.totalStoredOccurrences >= LIMITS.storedOccurrences ||
+              this.totalStoredOccurrenceBytes + occurrenceBytes >
+                LIMITS.storedOccurrenceBytes
+            ) {
+              unavailableOriginalPaths.add(entry.path);
+              addCoverageReason("STORED_OCCURRENCE_LIMIT");
+              continue;
+            }
+            occurrences.push({
+              line: canonicalLine ?? line,
+              lineNumber: index + 1,
+            });
+            collected.set(canonicalLine ?? line, retained + 1);
+            this.totalStoredOccurrences += 1;
+            this.totalStoredOccurrenceBytes += occurrenceBytes;
+          }
+          if (requested) {
+            currentPaths.set(entry.path, { path: entry.path, occurrences });
+          }
         }
-        let text: string;
-        try {
-          text = new TextDecoder("utf-8", { fatal: true }).decode(blob);
-        } catch {
-          repositoryComplete = false;
-          addCoverageReason("BLOB_ENCODING_UNAVAILABLE");
-          if (requested) unavailableOriginalPaths.add(entry.path);
-          continue;
-        }
-        const occurrences: CurrentPath["occurrences"] = [];
-        const lines = text.split("\n");
-        for (let index = 0; index < lines.length; index += 1) {
-          const line = normalizeLine(lines[index] ?? "");
-          if (!line) continue;
-          repositoryCounts.set(line, (repositoryCounts.get(line) ?? 0) + 1);
-          if (requested) occurrences.push({ line, lineNumber: index + 1 });
-        }
-        if (requested)
-          currentPaths.set(entry.path, { path: entry.path, occurrences });
       }
-      for (const path of input.requestedPaths) {
-        if (!entries.some((entry) => entry.path === path)) {
+      for (const path of requestedPaths) {
+        if (!entryPaths.has(path)) {
           currentPaths.set(path, { path, occurrences: [] });
         }
       }
@@ -312,19 +437,27 @@ export class GitSnapshotScanner {
       );
     }
     const started = performance.now();
-    const result = await spawnBounded("git", args, {
-      cwd,
-      env,
-      limits: {
-        timeoutMs: LIMITS.gitCommandMs,
-        stdoutBytes,
-        stderrBytes: LIMITS.gitStderrBytes,
-        monitor: async () =>
-          (await directorySize(workspace)) >= this.thresholdBytes,
-        ...(signal ? { signal } : {}),
-      },
-      ...(stdin ? { stdin } : {}),
-    });
+    let result: { stdout: Buffer; stderr: Buffer } | undefined;
+    let failure: unknown;
+    const invocation = gitInvocation(args);
+    try {
+      result = await spawnBounded(invocation.executable, invocation.args, {
+        cwd,
+        env,
+        limits: {
+          timeoutMs: LIMITS.gitCommandMs,
+          stdoutBytes,
+          stderrBytes: LIMITS.gitStderrBytes,
+          monitor: async () =>
+            (await directorySize(workspace)) >= this.thresholdBytes,
+          monitorMs: LIMITS.gitMonitorMs,
+          ...(signal ? { signal } : {}),
+        },
+        ...(stdin ? { stdin } : {}),
+      });
+    } catch (error) {
+      failure = error;
+    }
     this.totalGitMs += performance.now() - started;
     if (this.totalGitMs > LIMITS.gitTotalMs) {
       throw new AppError(
@@ -332,19 +465,110 @@ export class GitSnapshotScanner {
         "누적 Git 실행 시간 한도를 초과했습니다",
       );
     }
+    if (failure !== undefined) throw failure;
+    if (!result)
+      throw new AppError(
+        "ANALYSIS_FAILED",
+        "Git 실행 결과를 확인할 수 없습니다",
+      );
     return result;
   }
 
   private async preflight(): Promise<void> {
     const usage = await statfs(this.root);
     const free = usage.bavail * usage.bsize;
-    const configuredHeadroom = 64 * 1024 * 1024;
+    const configuredHeadroom = this.thresholdBytes + 64 * 1024 * 1024;
     if (free < configuredHeadroom) {
       throw new AppError(
         "WORKSPACE_LIMIT",
         "Git 작업을 위한 디스크 여유 공간이 부족합니다",
       );
     }
+  }
+}
+function gitInvocation(args: string[]): {
+  executable: string;
+  args: string[];
+} {
+  if (process.platform !== "linux") return { executable: "git", args };
+  return {
+    executable: "prlimit",
+    args: [
+      `--as=${LIMITS.gitAddressSpaceBytes}`,
+      `--cpu=${LIMITS.gitCpuSeconds}`,
+      `--fsize=${LIMITS.gitFileBytes}`,
+      `--nofile=${LIMITS.gitOpenFiles}`,
+      "--",
+      "git",
+      ...args,
+    ],
+  };
+}
+function partitionBlobEntries(entries: TreeEntry[]): TreeEntry[][] {
+  const oidSizes = new Map<string, number>();
+  const batches: TreeEntry[][] = [];
+  let batch: TreeEntry[] = [];
+  let batchOids = new Set<string>();
+  let batchBytes = 0;
+
+  for (const entry of entries) {
+    const knownSize = oidSizes.get(entry.oid);
+    if (knownSize !== undefined && knownSize !== entry.size) {
+      throw new AppError(
+        "ANALYSIS_FAILED",
+        "Git blob 크기가 일관되지 않습니다",
+      );
+    }
+    oidSizes.set(entry.oid, entry.size);
+
+    const addedBytes = batchOids.has(entry.oid) ? 0 : entry.size;
+    if (
+      batch.length > 0 &&
+      (batch.length >= LIMITS.blobBatchEntries ||
+        batchBytes + addedBytes > LIMITS.blobBatchBytes)
+    ) {
+      batches.push(batch);
+      batch = [];
+      batchOids = new Set();
+      batchBytes = 0;
+    }
+    batch.push(entry);
+    if (!batchOids.has(entry.oid)) {
+      batchOids.add(entry.oid);
+      batchBytes += entry.size;
+    }
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
+}
+
+function validateJobId(value: string): void {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  ) {
+    throw new AppError(
+      "ANALYSIS_FAILED",
+      "분석 작업 식별자가 안전하지 않습니다",
+    );
+  }
+}
+
+export function jobWorkspacePrefix(jobId: string): string {
+  validateJobId(jobId);
+  return `job-${jobId}-`;
+}
+
+export async function cleanupJobWorkspaces(
+  root: string,
+  jobId?: string,
+): Promise<void> {
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const prefix = jobId ? jobWorkspacePrefix(jobId) : "job-";
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (!entry.name.startsWith(prefix)) continue;
+    await rm(join(root, entry.name), { recursive: true, force: true });
   }
 }
 

@@ -20,6 +20,7 @@ export function validateUsername(value: unknown): string {
 export async function canonicalizeUser(
   client: GitHubClient,
   username: string,
+  signal?: AbortSignal,
 ): Promise<{ login: string; id: number; avatarUrl: string }> {
   const data = await client.json<{
     login?: unknown;
@@ -29,6 +30,7 @@ export async function canonicalizeUser(
   }>({
     path: `/users/${encodeURIComponent(username)}`,
     maxBytes: 256 * 1024,
+    ...(signal ? { signal } : {}),
   });
   if (
     typeof data.login !== "string" ||

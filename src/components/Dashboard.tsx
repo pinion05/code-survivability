@@ -22,6 +22,20 @@ export default function Dashboard(props: {
     window.setTimeout(() => setCopied(false), 1600);
   }
 
+  function scopeDescription(): string {
+    const scope = result().summary.scope;
+    const hasBlockingGap = scope.reasons.some(
+      (reason) => reason !== "SEARCH_CAP",
+    );
+    if (hasBlockingGap) {
+      return "발견 또는 선택된 PR 일부의 증거가 불완전해 상단 비율을 확인 불가로 처리했습니다.";
+    }
+    if (result().discovery.capped) {
+      return `GitHub 보고 ${scope.queryTotalCount ?? "알 수 없는 수"}개 중 ${scope.selectedPullRequests}개를 선택해 분석한 표본입니다. 비율은 전체 기여 기록이 아니라 이 표본에만 적용됩니다.`;
+    }
+    return `GitHub 검색 범위에서 선택된 ${scope.selectedPullRequests}개 PR을 모두 분석한 결과입니다.`;
+  }
+
   return (
     <div class="shell">
       <div class="result-header">
@@ -36,12 +50,23 @@ export default function Dashboard(props: {
             {new Date(result().authoritativeWindow.end).toLocaleDateString(
               "ko-KR",
             )}
-            까지의 공개 PR
+            까지 발견된 공개 PR의 선택·분석 표본
           </p>
         </div>
         <button class="share-button" type="button" onClick={copyShare}>
           {copied() ? "링크 복사됨" : "결과 링크 복사"}
         </button>
+      </div>
+
+      <div
+        class={`scope-notice ${result().summary.scope.complete ? "good" : "warn"}`}
+        role="note"
+      >
+        <strong>
+          집계 범위 · 선택·분석된 PR{" "}
+          {result().summary.scope.analyzedPullRequests}개
+        </strong>
+        <span>{scopeDescription()}</span>
       </div>
 
       <section aria-labelledby="metric-title">
@@ -50,35 +75,36 @@ export default function Dashboard(props: {
         </h2>
         <div class="metrics-grid">
           <MetricCard
-            label="원래 경로의 정확한 발생"
+            label="분석 표본 · 원래 경로의 정확한 발생"
             metric={result().summary.originalPath}
             note="경로 검사가 불완전합니다"
           />
           <MetricCard
-            label="저장소 전체 텍스트 발생"
+            label="분석 표본 · 저장소 전체 텍스트 발생"
             metric={result().summary.repositoryText}
             note="전체 트리 검사가 불완전합니다"
           />
           <MetricCard
-            label="Blame 평가 범위"
+            label="분석 표본 · Blame 평가 범위"
             metric={result().summary.blameEvaluated}
             note="완전한 blame을 얻지 못했습니다"
           />
           <MetricCard
-            label="PR 커밋 계보"
+            label="분석 표본 · PR 커밋 계보"
             metric={result().summary.lineage}
             note="계보를 완전히 확인하지 못했습니다"
           />
         </div>
         <div class="summary-line">
           <span>
-            적격 추가 줄{" "}
+            표본 적격 추가 줄{" "}
             <strong>
               {result().summary.eligibleAdditions.toLocaleString()}
             </strong>
           </span>
           <span>
-            분석 PR <strong>{result().summary.analyzedPullRequests}</strong>
+            표본 분석 PR{" "}
+            <strong>{result().summary.analyzedPullRequests}</strong>
           </span>
           <span>
             제외 PR <strong>{result().summary.excludedPullRequests}</strong>
@@ -148,7 +174,10 @@ export default function Dashboard(props: {
       <section class="panel pr-panel" aria-labelledby="pr-title">
         <div class="pr-header">
           <h2 id="pr-title">Pull request별 근거</h2>
-          <p>각 비율은 해당 지표에 완전한 증거가 있는 PR만 집계합니다.</p>
+          <p>
+            상단 비율은 선택된 PR 모두에서 해당 지표의 증거가 완전할 때만
+            표시합니다.
+          </p>
         </div>
         <div style={{ "overflow-x": "auto" }}>
           <table class="pr-list">

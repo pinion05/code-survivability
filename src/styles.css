@@ -412,6 +412,35 @@ button {
   padding: 11px 15px;
   border-radius: 10px;
 }
+.scope-notice {
+  display: flex;
+  align-items: baseline;
+  gap: 12px 20px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  font-size: 13px;
+}
+
+.scope-notice strong {
+  flex: 0 0 auto;
+  color: var(--text);
+}
+
+.scope-notice span {
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.scope-notice.good {
+  border-color: rgba(73, 214, 200, 0.2);
+  background: rgba(73, 214, 200, 0.045);
+}
+
+.scope-notice.warn {
+  border-color: rgba(244, 191, 105, 0.22);
+  background: rgba(244, 191, 105, 0.055);
+}
 .metrics-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -661,6 +690,10 @@ button {
     gap: 0;
   }
   .result-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .scope-notice {
     align-items: flex-start;
     flex-direction: column;
   }

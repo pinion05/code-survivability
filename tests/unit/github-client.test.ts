@@ -68,4 +68,45 @@ describe("bounded GitHub transport", () => {
     expect(error).toBeInstanceOf(AppError);
     expect((error as AppError).publicMessage).toContain("GitHub 요청 한도");
   });
+
+  test("keeps the deadline active while streaming the response body", async () => {
+    const client = new GitHubClient("token", undefined, (async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const signal = init?.signal;
+          signal?.addEventListener(
+            "abort",
+            () => controller.error(new Error("aborted")),
+            { once: true },
+          );
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch);
+
+    const error = (await rejection(
+      client.text({ path: "/slow", timeoutMs: 20 }),
+    )) as AppError;
+    expect(error.code).toBe("GITHUB_UNAVAILABLE");
+    expect(error.publicMessage).toContain("시간이 초과");
+  });
+
+  test("does not start a request after the job signal is already aborted", async () => {
+    let called = false;
+    const client = new GitHubClient("token", undefined, (async () => {
+      called = true;
+      return new Response("{}");
+    }) as unknown as typeof fetch);
+    const controller = new AbortController();
+    controller.abort();
+
+    const error = (await rejection(
+      client.text({ path: "/never", signal: controller.signal }),
+    )) as AppError;
+    expect(error.code).toBe("RUN_TIMEOUT");
+    expect(called).toBe(false);
+  });
 });

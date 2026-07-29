@@ -40,6 +40,16 @@ export const fixtureResult: AnalysisResult = {
     reasons: [],
   },
   summary: {
+    scope: {
+      kind: "SELECTED_ANALYZED_PULL_REQUESTS",
+      complete: true,
+      discoveryComplete: true,
+      queryTotalCount: 2,
+      selectedPullRequests: 2,
+      analyzedPullRequests: 2,
+      excludedPullRequests: 0,
+      reasons: [],
+    },
     eligibleAdditions: 100,
     analyzedPullRequests: 2,
     excludedPullRequests: 0,

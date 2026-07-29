@@ -46,6 +46,7 @@ export async function discoverCandidates(
   client: GitHubClient,
   canonicalLogin: string,
   snapshot = new Date(),
+  signal?: AbortSignal,
 ): Promise<{ candidates: Candidate[]; coverage: DiscoveryCoverage }> {
   const windowStart = subtractCalendarMonths(snapshot, 24);
   const query = `type:pr author:${canonicalLogin} -user:${canonicalLogin} is:merged merged:${dateOnly(windowStart)}..${dateOnly(snapshot)} is:public`;
@@ -53,13 +54,23 @@ export async function discoverCandidates(
     path: `/search/issues?q=${encodeURIComponent(query)}&sort=updated&order=desc&per_page=${LIMITS.maxCandidates}&page=1`,
     maxBytes: LIMITS.searchBytes,
     timeoutMs: LIMITS.searchMs,
+    ...(signal ? { signal } : {}),
   });
-  if (!Array.isArray(search.items)) {
+  if (
+    !Array.isArray(search.items) ||
+    !Number.isSafeInteger(search.total_count) ||
+    (search.total_count ?? -1) < 0 ||
+    typeof search.incomplete_results !== "boolean" ||
+    search.items.length > LIMITS.maxCandidates ||
+    (search.total_count ?? -1) < search.items.length
+  ) {
     throw new AppError(
       "GITHUB_UNAVAILABLE",
       "GitHub 검색 응답이 올바르지 않습니다",
     );
   }
+  const total = search.total_count as number;
+  const incomplete = search.incomplete_results;
 
   const reasons: DiscoveryCoverage["reasons"] = [];
   const hydrated: Candidate[] = [];
@@ -74,9 +85,12 @@ export async function discoverCandidates(
     }
     try {
       const path = new URL(url).pathname.replace(/^\/?/, "/");
-      hydrated.push(await hydrateCandidate(client, path));
+      hydrated.push(await hydrateCandidate(client, path, signal));
     } catch (error) {
-      if (error instanceof AppError && error.code === "RATE_LIMITED")
+      if (
+        error instanceof AppError &&
+        (error.code === "RATE_LIMITED" || error.code === "RUN_TIMEOUT")
+      )
         throw error;
       reasons.push({
         code: "HYDRATION_FAILED",
@@ -92,13 +106,7 @@ export async function discoverCandidates(
       a.number - b.number,
   );
   const candidates = hydrated.slice(0, LIMITS.maxCandidates);
-  const total =
-    typeof search.total_count === "number" ? search.total_count : null;
-  const incomplete =
-    typeof search.incomplete_results === "boolean"
-      ? search.incomplete_results
-      : null;
-  const capped = total !== null && total > LIMITS.maxCandidates;
+  const capped = total > LIMITS.maxCandidates;
   if (capped)
     reasons.push({
       code: "SEARCH_CAP",
@@ -132,8 +140,13 @@ export async function discoverCandidates(
 async function hydrateCandidate(
   client: GitHubClient,
   path: string,
+  signal?: AbortSignal,
 ): Promise<Candidate> {
-  const pr = await client.json<any>({ path, maxBytes: 1024 * 1024 });
+  const pr = await client.json<any>({
+    path,
+    maxBytes: 1024 * 1024,
+    ...(signal ? { signal } : {}),
+  });
   if (
     typeof pr.number !== "number" ||
     typeof pr.title !== "string" ||
@@ -142,6 +155,8 @@ async function hydrateCandidate(
     typeof pr.merge_commit_sha !== "string" ||
     typeof pr.additions !== "number" ||
     typeof pr.changed_files !== "number" ||
+    !Number.isSafeInteger(pr.commits) ||
+    pr.commits < 1 ||
     typeof pr.base?.repo?.id !== "number" ||
     typeof pr.base.repo.full_name !== "string" ||
     typeof pr.base.repo.html_url !== "string" ||
@@ -155,19 +170,40 @@ async function hydrateCandidate(
   if (!owner || !repo)
     throw new AppError("GITHUB_UNAVAILABLE", "저장소 이름이 올바르지 않습니다");
 
-  const commitData = await client.json<Array<{ sha?: unknown }>>({
-    path: `${path}/commits?per_page=${LIMITS.commitShasPerPr}`,
-    maxBytes: 2 * 1024 * 1024,
-  });
-  if (
-    !Array.isArray(commitData) ||
-    commitData.length > LIMITS.commitShasPerPr
-  ) {
-    throw new AppError("GITHUB_RESPONSE_LIMIT", "PR 커밋 한도를 초과했습니다");
+  if (pr.commits > LIMITS.commitShasPerPr) {
+    throw new AppError(
+      "GITHUB_RESPONSE_LIMIT",
+      "PR 커밋 수가 분석 한도를 초과했습니다",
+    );
   }
-  const commitShas = commitData
-    .map((item) => item.sha)
-    .filter((sha): sha is string => typeof sha === "string");
+  const commitShas: string[] = [];
+  const perPage = 100;
+  const pages = Math.ceil(pr.commits / perPage);
+  for (let page = 1; page <= pages; page += 1) {
+    const commitData = await client.json<Array<{ sha?: unknown }>>({
+      path: `${path}/commits?per_page=${perPage}&page=${page}`,
+      maxBytes: 2 * 1024 * 1024,
+      ...(signal ? { signal } : {}),
+    });
+    if (
+      !Array.isArray(commitData) ||
+      commitData.some((item) => typeof item.sha !== "string") ||
+      commitShas.length + commitData.length > LIMITS.commitShasPerPr
+    ) {
+      throw new AppError(
+        "GITHUB_RESPONSE_LIMIT",
+        "PR 커밋 목록을 완전하게 확인할 수 없습니다",
+      );
+    }
+    commitShas.push(...commitData.map((item) => item.sha as string));
+    if (commitData.length < perPage) break;
+  }
+  if (commitShas.length !== pr.commits) {
+    throw new AppError(
+      "GITHUB_RESPONSE_LIMIT",
+      "PR 커밋 목록을 완전하게 확인할 수 없습니다",
+    );
+  }
   return {
     repositoryId: pr.base.repo.id,
     repository: pr.base.repo.full_name,

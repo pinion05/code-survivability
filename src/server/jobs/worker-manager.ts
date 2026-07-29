@@ -3,6 +3,8 @@ import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { AppError, type ErrorCode } from "../errors";
 import type { AnalysisResult } from "../schemas/result";
+import { cleanupJobWorkspaces } from "../git/scanner";
+import { LIMITS } from "../schemas/limits";
 import type { ProgressUpdate } from "../analysis/pipeline";
 
 type Pending = {
@@ -10,7 +12,7 @@ type Pending = {
   resolve: (result: AnalysisResult) => void;
   reject: (error: Error) => void;
   onProgress: (progress: ProgressUpdate) => void;
-  abort?: () => void;
+  cleanup?: () => void;
 };
 
 export class WorkerManager {
@@ -19,9 +21,13 @@ export class WorkerManager {
   private generation = 0;
   private ready = false;
   private stopping = false;
+  private recoveryTimer: NodeJS.Timeout | null = null;
 
-  constructor() {
-    this.spawn();
+  constructor(
+    private readonly workspaceRoot = process.env.WORKSPACE_ROOT?.trim() ||
+      "/tmp/code-survivability",
+  ) {
+    this.prepareWorker();
   }
 
   isReady(): boolean {
@@ -32,29 +38,50 @@ export class WorkerManager {
     return this.generation;
   }
 
-  run(
+  async run(
     id: string,
     canonicalLogin: string,
     signal: AbortSignal,
     onProgress: (progress: ProgressUpdate) => void,
   ): Promise<AnalysisResult> {
-    if (!this.isReady() || !this.worker || this.pending) {
-      return Promise.reject(
-        new AppError("NOT_READY", "분석 워커가 준비되지 않았습니다"),
-      );
+    if (this.stopping) {
+      throw new AppError("NOT_READY", "분석 워커가 준비되지 않았습니다");
     }
+    if (signal.aborted) {
+      throw new AppError("RUN_TIMEOUT", "분석 실행 시간이 초과되었습니다");
+    }
+    await this.waitUntilReady(signal);
+    if (signal.aborted) {
+      throw new AppError("RUN_TIMEOUT", "분석 실행 시간이 초과되었습니다");
+    }
+    if (!this.worker || this.pending) {
+      throw new AppError("NOT_READY", "분석 워커가 준비되지 않았습니다");
+    }
+
+    const worker = this.worker;
     return new Promise((resolvePromise, reject) => {
-      const abort = (): void =>
-        this.worker?.postMessage({ type: "cancel", id });
+      let killTimer: NodeJS.Timeout | undefined;
+      const abort = (): void => {
+        worker.postMessage({ type: "cancel", id });
+        killTimer = setTimeout(() => {
+          if (this.pending?.id === id && this.worker === worker) {
+            void worker.terminate();
+          }
+        }, 2_000);
+        killTimer.unref();
+      };
       signal.addEventListener("abort", abort, { once: true });
       this.pending = {
         id,
         resolve: resolvePromise,
         reject,
         onProgress,
-        abort: () => signal.removeEventListener("abort", abort),
+        cleanup: () => {
+          signal.removeEventListener("abort", abort);
+          if (killTimer) clearTimeout(killTimer);
+        },
       };
-      this.worker?.postMessage({
+      worker.postMessage({
         type: "run",
         id,
         canonicalLogin,
@@ -66,12 +93,18 @@ export class WorkerManager {
   async stop(): Promise<void> {
     this.stopping = true;
     this.ready = false;
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = null;
+    const pendingId = this.pending?.id ?? null;
     this.pending?.reject(
       new AppError("WORKER_CRASH", "분석 워커가 종료되었습니다"),
     );
     this.clearPending();
     if (this.worker) await this.worker.terminate();
     this.worker = null;
+    if (pendingId) {
+      await cleanupJobWorkspaces(this.workspaceRoot, pendingId);
+    }
   }
 
   private spawn(): void {
@@ -81,7 +114,14 @@ export class WorkerManager {
     const workerUrl = pathToFileURL(
       resolve(process.cwd(), "src/server/analysis/worker.ts"),
     );
-    const worker = new Worker(workerUrl, { execArgv: ["--import", "tsx"] });
+    const worker = new Worker(workerUrl, {
+      execArgv: ["--import", "tsx"],
+      resourceLimits: {
+        maxOldGenerationSizeMb: LIMITS.workerOldGenerationMb,
+        maxYoungGenerationSizeMb: LIMITS.workerYoungGenerationMb,
+        stackSizeMb: LIMITS.workerStackMb,
+      },
+    });
     this.worker = worker;
     const generation = this.generation;
     worker.on("message", (message: unknown) => {
@@ -115,18 +155,45 @@ export class WorkerManager {
     worker.on("error", () => undefined);
     worker.on("exit", () => {
       if (generation !== this.generation) return;
+      const interruptedJobId = this.pending?.id;
       this.ready = false;
       this.worker = null;
       this.pending?.reject(
         new AppError("WORKER_CRASH", "분석 워커가 비정상 종료되었습니다"),
       );
       this.clearPending();
-      if (!this.stopping) setTimeout(() => this.spawn(), 100).unref();
+      if (!this.stopping) this.prepareWorker(interruptedJobId);
     });
   }
 
+  private async waitUntilReady(signal: AbortSignal): Promise<void> {
+    const deadline = Date.now() + LIMITS.workerRecoveryMs;
+    while (!this.isReady()) {
+      if (signal.aborted) {
+        throw new AppError("RUN_TIMEOUT", "분석 실행 시간이 초과되었습니다");
+      }
+      if (this.stopping || Date.now() >= deadline) {
+        throw new AppError("NOT_READY", "분석 워커가 준비되지 않았습니다");
+      }
+      await new Promise<void>((resolvePromise) =>
+        setTimeout(resolvePromise, 25),
+      );
+    }
+  }
+
+  private prepareWorker(jobId?: string): void {
+    void cleanupJobWorkspaces(this.workspaceRoot, jobId)
+      .then(() => {
+        if (!this.stopping && !this.worker) this.spawn();
+      })
+      .catch(() => {
+        if (this.stopping) return;
+        this.recoveryTimer = setTimeout(() => this.prepareWorker(jobId), 1_000);
+        this.recoveryTimer.unref();
+      });
+  }
   private clearPending(): void {
-    this.pending?.abort?.();
+    this.pending?.cleanup?.();
     this.pending = null;
   }
 }

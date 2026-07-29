@@ -56,7 +56,19 @@ export type RepositoryResult = {
   coverage: CoverageReason[];
 };
 
+export type SummaryScope = {
+  kind: "SELECTED_ANALYZED_PULL_REQUESTS";
+  complete: boolean;
+  discoveryComplete: boolean;
+  queryTotalCount: number | null;
+  selectedPullRequests: number;
+  analyzedPullRequests: number;
+  excludedPullRequests: number;
+  reasons: string[];
+};
+
 export type MetricSummary = {
+  scope: SummaryScope;
   eligibleAdditions: number;
   analyzedPullRequests: number;
   excludedPullRequests: number;

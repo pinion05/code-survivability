@@ -40,7 +40,13 @@ type Response = {
 
 export async function fetchCompleteBlame(
   client: GitHubClient,
-  input: { owner: string; repo: string; oid: string; path: string },
+  input: {
+    owner: string;
+    repo: string;
+    oid: string;
+    path: string;
+    signal?: AbortSignal;
+  },
 ): Promise<CompleteBlame | null> {
   const response = await client.json<Response>({
     graphql: {
@@ -53,6 +59,7 @@ export async function fetchCompleteBlame(
       },
     },
     maxBytes: LIMITS.graphqlBytes,
+    ...(input.signal ? { signal: input.signal } : {}),
   });
   if (response.errors?.length) return null;
   const object = response.data?.repository?.object;

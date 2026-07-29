@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { JobRegistry, type Runner } from "../../src/server/jobs/registry";
 import type { AnalysisResult } from "../../src/server/schemas/result";
 import { AppError } from "../../src/server/errors";
+import { LIMITS } from "../../src/server/schemas/limits";
 
 type Resolver = (result: AnalysisResult) => void;
 
@@ -100,6 +101,55 @@ describe("one-running one-waiting registry", () => {
     await settle();
   });
 
+  test("counts unresolved reservations toward the per-client limit", () => {
+    const { runner } = deferredRunner();
+    const registry = new JobRegistry(runner);
+    const reservation = registry.reserve("same-client");
+
+    expect(() => registry.reserve("same-client")).toThrow(
+      "클라이언트별 동시 분석 한도",
+    );
+
+    registry.releaseReservation(reservation);
+    expect(typeof registry.reserve("same-client")).toBe("string");
+  });
+
+  test("caps alias storage and expires stale aliases", async () => {
+    let now = 0;
+    const { runner, resolvers } = deferredRunner();
+    const registry = new JobRegistry(
+      runner,
+      () => 1,
+      () => now,
+    );
+    const created = registry.finalizeReservation(
+      registry.reserve("client-owner"),
+      "alias-0",
+      "pinion05",
+    );
+
+    for (let index = 1; index < LIMITS.aliasEntries + 50; index += 1) {
+      const duplicate = registry.finalizeReservation(
+        registry.reserve(`client-${index}`),
+        `alias-${index}`,
+        "pinion05",
+      );
+      expect(duplicate.job.id).toBe(created.job.id);
+    }
+
+    expect(registry.lookupKnownAlias("alias-0")).toBeNull();
+    expect(
+      registry.lookupKnownAlias(`alias-${LIMITS.aliasEntries + 49}`)?.job.id,
+    ).toBe(created.job.id);
+
+    now = LIMITS.aliasTtlMs + 1;
+    expect(
+      registry.lookupKnownAlias(`alias-${LIMITS.aliasEntries + 49}`),
+    ).toBeNull();
+
+    resolvers.get(created.job.id)?.(fixtureResult(created.job.id, "pinion05"));
+    await settle();
+  });
   test("aborts the active runner and marks it cancelled during shutdown", async () => {
     let aborted = false;
     const runner: Runner = (_id, _login, signal) =>

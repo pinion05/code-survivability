@@ -7,6 +7,7 @@ export type SpawnLimits = {
   stderrBytes: number;
   signal?: AbortSignal;
   monitor?: () => Promise<boolean>;
+  monitorMs?: number;
 };
 
 export async function spawnBounded(
@@ -19,6 +20,9 @@ export async function spawnBounded(
     stdin?: Buffer;
   },
 ): Promise<{ stdout: Buffer; stderr: Buffer }> {
+  if (options.limits.signal?.aborted) {
+    throw new AppError("RUN_TIMEOUT", "분석 실행 시간이 초과되었습니다");
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd: options.cwd,
@@ -68,19 +72,41 @@ export async function spawnBounded(
       terminate();
     };
     options.limits.signal?.addEventListener("abort", abort, { once: true });
-    const monitor = options.limits.monitor
-      ? setInterval(() => {
-          void options.limits.monitor?.().then((overLimit) => {
-            if (overLimit && !limitError) {
-              limitError = new AppError(
-                "WORKSPACE_LIMIT",
-                "작업 공간 한도를 초과했습니다",
-              );
-              terminate();
-            }
-          });
-        }, 250)
-      : null;
+    let monitorTimer: NodeJS.Timeout | null = null;
+    const runMonitor = async (): Promise<void> => {
+      if (settled || !options.limits.monitor || limitError) return;
+      try {
+        if (await options.limits.monitor()) {
+          limitError = new AppError(
+            "WORKSPACE_LIMIT",
+            "작업 공간 한도를 초과했습니다",
+          );
+          terminate();
+          return;
+        }
+      } catch {
+        limitError = new AppError(
+          "ANALYSIS_FAILED",
+          "작업 공간 사용량을 확인하지 못했습니다",
+        );
+        terminate();
+        return;
+      }
+      if (!settled && !limitError) {
+        monitorTimer = setTimeout(
+          () => void runMonitor(),
+          options.limits.monitorMs ?? 500,
+        );
+        monitorTimer.unref();
+      }
+    };
+    if (options.limits.monitor) {
+      monitorTimer = setTimeout(
+        () => void runMonitor(),
+        options.limits.monitorMs ?? 500,
+      );
+      monitorTimer.unref();
+    }
 
     if (options.stdin) {
       child.stdin?.on("error", () => undefined);
@@ -136,7 +162,7 @@ export async function spawnBounded(
 
     function cleanup(): void {
       clearTimeout(timeout);
-      if (monitor) clearInterval(monitor);
+      if (monitorTimer) clearTimeout(monitorTimer);
       options.limits.signal?.removeEventListener("abort", abort);
     }
   });

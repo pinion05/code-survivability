@@ -13,13 +13,14 @@ import {
 import type {
   AnalysisResult,
   CoverageReason,
+  DiscoveryCoverage,
   MetricSummary,
   MetricValue,
   PullRequestResult,
   RepositoryResult,
 } from "../schemas/result";
 import type { ParsedDiff } from "./diff-parser";
-import { createMetric, evaluateMetrics } from "./metrics";
+import { createMetric, evaluateMetrics, type CompleteBlame } from "./metrics";
 
 export type ProgressUpdate = {
   phase: string;
@@ -52,6 +53,7 @@ export async function runAnalysis(
     client,
     input.canonicalLogin,
     now,
+    input.signal,
   );
   input.onProgress?.({
     phase: "DIFFS",
@@ -63,26 +65,32 @@ export async function runAnalysis(
   const exclusions: CoverageReason[] = [...discovery.reasons];
   const valid: ValidCandidate[] = [];
   let eligibleTotal = 0;
+  let eligibleByteTotal = 0;
   for (const candidate of candidates) {
     try {
-      const diff = await fetchValidatedDiff(client, candidate);
+      const diff = await fetchValidatedDiff(client, candidate, input.signal);
       if (
         eligibleTotal + diff.eligibleAdditions.length >
-        LIMITS.maxEligibleAdditions
+          LIMITS.maxEligibleAdditions ||
+        eligibleByteTotal + diff.eligibleBytes > LIMITS.eligibleAdditionBytes
       ) {
         exclusions.push(
           reason(
             "ANALYSIS_ADDITION_LIMIT",
-            "분석 적격 줄 한도로 PR을 제외했습니다",
+            "분석 적격 줄 또는 바이트 한도로 PR을 제외했습니다",
             candidate,
           ),
         );
       } else {
         eligibleTotal += diff.eligibleAdditions.length;
+        eligibleByteTotal += diff.eligibleBytes;
         valid.push({ candidate, diff });
       }
     } catch (error) {
-      if (error instanceof AppError && error.code === "WORKSPACE_LIMIT")
+      if (
+        error instanceof AppError &&
+        (error.code === "WORKSPACE_LIMIT" || error.code === "RUN_TIMEOUT")
+      )
         throw error;
       exclusions.push(reason("DIFF_EXCLUDED", publicReason(error), candidate));
     }
@@ -118,21 +126,35 @@ export async function runAnalysis(
   const pullRequests: PullRequestResult[] = [];
   const repositories: RepositoryResult[] = [];
   let completed = candidates.length;
+  let totalBlameRanges = 0;
+  let blameRangeLimitReached = false;
   for (const group of repositoryGroups.values()) {
     const first = group[0]!;
-    const requestedPaths = new Set(
-      group.flatMap((item) =>
-        item.diff.eligibleAdditions.map((line) => line.path),
-      ),
-    );
+    const requestedLineCounts = new Map<string, Map<string, number>>();
+    for (const item of group) {
+      const perPullRequest = new Map<string, Map<string, number>>();
+      for (const addition of item.diff.eligibleAdditions) {
+        const counts = perPullRequest.get(addition.path) ?? new Map();
+        counts.set(addition.line, (counts.get(addition.line) ?? 0) + 1);
+        perPullRequest.set(addition.path, counts);
+      }
+      for (const [path, counts] of perPullRequest) {
+        const retained = requestedLineCounts.get(path) ?? new Map();
+        for (const [line, count] of counts) {
+          retained.set(line, Math.max(retained.get(line) ?? 0, count));
+        }
+        requestedLineCounts.set(path, retained);
+      }
+    }
     let snapshot: SnapshotResult | null = null;
     const repositoryCoverage: CoverageReason[] = [];
     try {
       snapshot = await scanner.scan({
+        jobId: input.id,
         owner: first.candidate.owner,
         repo: first.candidate.repo,
         defaultBranch: first.candidate.defaultBranch,
-        requestedPaths,
+        requestedLineCounts,
         ...(input.signal ? { signal: input.signal } : {}),
       });
       for (const code of snapshot.coverageReasons) {
@@ -142,7 +164,11 @@ export async function runAnalysis(
         });
       }
     } catch (error) {
-      if (error instanceof AppError && error.code === "WORKSPACE_LIMIT")
+      if (
+        input.signal?.aborted ||
+        (error instanceof AppError &&
+          (error.code === "WORKSPACE_LIMIT" || error.code === "RUN_TIMEOUT"))
+      )
         throw error;
       repositoryCoverage.push({
         code: "REPOSITORY_SCAN_UNAVAILABLE",
@@ -160,7 +186,8 @@ export async function runAnalysis(
     });
 
     for (const item of group) {
-      const blameByPath = new Map();
+      const pullRequestCoverage = [...repositoryCoverage];
+      const blameByPath = new Map<string, CompleteBlame | null>();
       const paths = new Set(
         item.diff.eligibleAdditions.map((addition) => addition.path),
       );
@@ -170,21 +197,58 @@ export async function runAnalysis(
         paths.size <= LIMITS.blamePathsPerPr
       ) {
         for (const path of paths) {
+          if (blameRangeLimitReached) {
+            blameByPath.set(path, null);
+            if (
+              !pullRequestCoverage.some(
+                (entry) => entry.code === "BLAME_RANGE_LIMIT",
+              )
+            ) {
+              const limitReason = reason(
+                "BLAME_RANGE_LIMIT",
+                "분석 전체 blame 범위 한도에 도달했습니다",
+                item.candidate,
+              );
+              pullRequestCoverage.push(limitReason);
+              exclusions.push(limitReason);
+            }
+            continue;
+          }
           if (snapshot.unavailableOriginalPaths.has(path)) {
             blameByPath.set(path, null);
             continue;
           }
           try {
-            blameByPath.set(
+            const blame = await fetchCompleteBlame(client, {
+              owner: item.candidate.owner,
+              repo: item.candidate.repo,
+              oid: snapshot.authoritativeOid,
               path,
-              await fetchCompleteBlame(client, {
-                owner: item.candidate.owner,
-                repo: item.candidate.repo,
-                oid: snapshot.authoritativeOid,
-                path,
-              }),
-            );
-          } catch {
+              ...(input.signal ? { signal: input.signal } : {}),
+            });
+            if (
+              blame &&
+              totalBlameRanges + blame.ranges.length > LIMITS.blameRanges
+            ) {
+              blameRangeLimitReached = true;
+              const limitReason = reason(
+                "BLAME_RANGE_LIMIT",
+                "분석 전체 blame 범위 한도에 도달했습니다",
+                item.candidate,
+              );
+              pullRequestCoverage.push(limitReason);
+              exclusions.push(limitReason);
+              blameByPath.set(path, null);
+            } else {
+              totalBlameRanges += blame?.ranges.length ?? 0;
+              blameByPath.set(path, blame);
+            }
+          } catch (error) {
+            if (
+              input.signal?.aborted ||
+              (error instanceof AppError && error.code === "RUN_TIMEOUT")
+            )
+              throw error;
             blameByPath.set(path, null);
           }
         }
@@ -218,14 +282,14 @@ export async function runAnalysis(
         blameEvaluated: metrics.blameEvaluated,
         lineage: metrics.lineage,
         excluded: false,
-        exclusions: repositoryCoverage,
+        exclusions: pullRequestCoverage,
       });
       completed += 1;
       input.onProgress?.({
         phase: "SCANNING_REPOSITORIES",
         completedUnits: completed,
         totalUnits: Math.max(candidates.length * 2, 1),
-        coverageWarnings: exclusions.length + repositoryCoverage.length,
+        coverageWarnings: exclusions.length + pullRequestCoverage.length,
       });
     }
   }
@@ -262,7 +326,7 @@ export async function runAnalysis(
       end: discovery.windowEnd,
     },
     discovery,
-    summary: summarize(pullRequests),
+    summary: summarize(pullRequests, discovery),
     repositories,
     pullRequests,
     exclusions,
@@ -275,6 +339,7 @@ export async function runAnalysis(
       "정규화된 줄의 정확한 중복 발생 횟수만 비교하며 의미적 동등성은 판단하지 않습니다.",
       "결과 링크는 메모리 캐시의 TTL, 재시작, 배포 또는 제거 시 사라집니다.",
       "불완전한 트리·blob·blame 증거는 0점이나 부분 점수로 대체하지 않습니다.",
+      "상단 비율은 검색 알고리즘이 선택하고 증거를 완전히 확인한 PR 표본에만 적용됩니다.",
     ],
     shareExpiresAt: new Date(Date.now() + LIMITS.resultTtlMs).toISOString(),
   };
@@ -334,29 +399,80 @@ function excludedPullRequest(
   };
 }
 
-function summarize(pullRequests: PullRequestResult[]): MetricSummary {
+export function summarize(
+  pullRequests: PullRequestResult[],
+  discovery: DiscoveryCoverage,
+): MetricSummary {
   const included = pullRequests.filter((pr) => !pr.excluded);
+  const excluded = pullRequests.filter((pr) => pr.excluded);
+  const discoveryReasonCodes = [
+    ...new Set(discovery.reasons.map((entry) => entry.code)),
+  ];
+  const blockingScopeReasons = discoveryReasonCodes.filter(
+    (code) => code !== "SEARCH_CAP",
+  );
+  if (
+    !discovery.complete &&
+    !discovery.capped &&
+    blockingScopeReasons.length === 0
+  ) {
+    blockingScopeReasons.push("DISCOVERY_EVIDENCE_INCOMPLETE");
+  }
+  if (excluded.length > 0) {
+    blockingScopeReasons.push("SELECTED_PULL_REQUESTS_EXCLUDED");
+  }
   const aggregate = (
     select: (pr: PullRequestResult) => MetricValue,
   ): MetricValue => {
-    const available = included.map(select).filter((value) => value.available);
-    const numerator = available.reduce(
-      (sum, value) => sum + value.numerator,
-      0,
-    );
-    const denominator = available.reduce(
+    const values = included.map(select);
+    const denominator = values.reduce(
       (sum, value) => sum + value.denominator,
       0,
     );
-    return createMetric(numerator, denominator, true, []);
+    const unavailable = values.filter((value) => !value.available);
+    if (
+      values.length === 0 ||
+      denominator === 0 ||
+      unavailable.length > 0 ||
+      blockingScopeReasons.length > 0
+    ) {
+      const unavailableReasons = new Set([
+        ...unavailable.flatMap((value) => value.unavailableReasons),
+        ...blockingScopeReasons,
+      ]);
+      if (values.length === 0)
+        unavailableReasons.add("NO_ANALYZABLE_PULL_REQUESTS");
+      else if (denominator === 0) unavailableReasons.add("NO_ELIGIBLE_LINES");
+      else if (unavailable.length > 0)
+        unavailableReasons.add("PARTIAL_EVIDENCE_NOT_AGGREGATED");
+      return createMetric(0, denominator, false, [...unavailableReasons]);
+    }
+    return createMetric(
+      values.reduce((sum, value) => sum + value.numerator, 0),
+      denominator,
+      true,
+      [],
+    );
   };
+  const scopeReasons = [...discoveryReasonCodes];
+  if (excluded.length > 0) scopeReasons.push("SELECTED_PULL_REQUESTS_EXCLUDED");
   return {
+    scope: {
+      kind: "SELECTED_ANALYZED_PULL_REQUESTS",
+      complete: discovery.complete && excluded.length === 0,
+      discoveryComplete: discovery.complete,
+      queryTotalCount: discovery.queryTotalCount,
+      selectedPullRequests: discovery.selectedCount,
+      analyzedPullRequests: included.length,
+      excludedPullRequests: excluded.length,
+      reasons: [...new Set(scopeReasons)],
+    },
     eligibleAdditions: included.reduce(
       (sum, pr) => sum + pr.eligibleAdditions,
       0,
     ),
     analyzedPullRequests: included.length,
-    excludedPullRequests: pullRequests.length - included.length,
+    excludedPullRequests: excluded.length,
     originalPath: aggregate((pr) => pr.originalPath),
     repositoryText: aggregate((pr) => pr.repositoryText),
     blameEvaluated: aggregate((pr) => pr.blameEvaluated),

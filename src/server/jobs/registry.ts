@@ -46,10 +46,11 @@ export type FinalizeResult = {
   deduplicated: boolean;
   cached: boolean;
 };
+type AliasEntry = { canonicalLogin: string; expiresAt: number };
 
 export class JobRegistry {
   private readonly jobs = new Map<string, JobRecord>();
-  private readonly aliases = new Map<string, string>();
+  private readonly aliases = new Map<string, AliasEntry>();
   private readonly dedupe = new Map<string, string>();
   private readonly reservations = new Map<string, string>();
   private readonly results: WeightedLru<AnalysisResult>;
@@ -58,6 +59,7 @@ export class JobRegistry {
   private shuttingDown = false;
   private runningController: AbortController | null = null;
   private runningCompletion: Promise<void> | null = null;
+  private lastSweepAt = Number.NEGATIVE_INFINITY;
 
   constructor(
     private readonly runner: Runner,
@@ -73,20 +75,28 @@ export class JobRegistry {
 
   lookupKnownAlias(rawAlias: string): FinalizeResult | null {
     this.sweep();
-    const canonical = this.aliases.get(rawAlias.toLowerCase());
-    if (!canonical) return null;
-    return this.lookupDedupe(analysisFingerprint(canonical));
+    const key = rawAlias.toLowerCase();
+    const alias = this.aliases.get(key);
+    if (!alias) return null;
+    this.aliases.delete(key);
+    this.aliases.set(key, {
+      canonicalLogin: alias.canonicalLogin,
+      expiresAt: this.now() + LIMITS.aliasTtlMs,
+    });
+    return this.lookupDedupe(analysisFingerprint(alias.canonicalLogin));
   }
 
   reserve(clientKey: string): string {
     this.sweep();
     if (this.shuttingDown)
       throw new AppError("SHUTTING_DOWN", "서버가 종료 중입니다");
-    const existingClient = [...this.jobs.values()].some(
-      (job) =>
-        job.clientKey === clientKey &&
-        (job.state === "RUNNING" || job.state === "QUEUED"),
-    );
+    const existingClient =
+      [...this.reservations.values()].includes(clientKey) ||
+      [...this.jobs.values()].some(
+        (job) =>
+          job.clientKey === clientKey &&
+          (job.state === "RUNNING" || job.state === "QUEUED"),
+      );
     if (existingClient) {
       throw new AppError(
         "CLIENT_JOB_LIMIT",
@@ -119,8 +129,8 @@ export class JobRegistry {
     if (!clientKey)
       throw new AppError("CAPACITY_FULL", "분석 예약이 만료되었습니다");
     const dedupeKey = analysisFingerprint(canonicalLogin);
-    this.aliases.set(rawAlias.toLowerCase(), canonicalLogin);
-    this.aliases.set(canonicalLogin.toLowerCase(), canonicalLogin);
+    this.rememberAlias(rawAlias, canonicalLogin);
+    this.rememberAlias(canonicalLogin, canonicalLogin);
     const existing = this.lookupDedupe(dedupeKey);
     if (existing) {
       this.reservations.delete(token);
@@ -253,8 +263,7 @@ export class JobRegistry {
       job.canonicalLogin,
       controller.signal,
       (progress) => {
-        if (job.state !== "RUNNING" || job.generation !== this.generation())
-          return;
+        if (job.state !== "RUNNING") return;
         if (progress.completedUnits < job.progress.completedUnits) return;
         job.phase = progress.phase;
         job.progress = {
@@ -345,9 +354,29 @@ export class JobRegistry {
     this.dedupe.delete(job.dedupeKey);
   }
 
+  private rememberAlias(rawAlias: string, canonicalLogin: string): void {
+    const key = rawAlias.toLowerCase();
+    this.aliases.delete(key);
+    this.aliases.set(key, {
+      canonicalLogin,
+      expiresAt: this.now() + LIMITS.aliasTtlMs,
+    });
+    while (this.aliases.size > LIMITS.aliasEntries) {
+      const oldest = this.aliases.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.aliases.delete(oldest);
+    }
+  }
+
   private sweep(): void {
-    this.results.sweep();
     const now = this.now();
+    if (now - this.lastSweepAt < LIMITS.registrySweepMs) return;
+    this.lastSweepAt = now;
+    this.results.sweep();
+    for (const [key, alias] of this.aliases) {
+      if (alias.expiresAt > now) break;
+      this.aliases.delete(key);
+    }
     for (const [id, job] of this.jobs) {
       if (!job.terminalAt) continue;
       const ttl =

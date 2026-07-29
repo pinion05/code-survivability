@@ -5,6 +5,7 @@ import { isEligiblePath, normalizeLine } from "./normalize";
 export type ParsedAddition = { path: string; line: string };
 export type ParsedDiff = {
   rawAdditions: number;
+  eligibleBytes: number;
   changedFiles: number;
   eligibleAdditions: ParsedAddition[];
   representedPaths: string[];
@@ -30,6 +31,18 @@ function parseDestination(value: string): string | null {
   if (!isEligiblePath(path)) return path;
   return path;
 }
+function* iterateDiffLines(diff: string): Generator<string> {
+  let start = 0;
+  while (start <= diff.length) {
+    const end = diff.indexOf("\n", start);
+    if (end < 0) {
+      yield diff.slice(start);
+      return;
+    }
+    yield diff.slice(start, end);
+    start = end + 1;
+  }
+}
 
 export function parseAndValidateDiff(
   diff: string,
@@ -41,9 +54,9 @@ export function parseAndValidateDiff(
       "PR diff 크기 한도를 초과했습니다",
     );
   }
-  const lines = diff.split("\n");
   const eligibleAdditions: ParsedAddition[] = [];
   const representedPaths: string[] = [];
+  let eligibleBytes = 0;
   let current: FileState | null = null;
   let rawAdditions = 0;
   let fileCount = 0;
@@ -58,8 +71,7 @@ export function parseAndValidateDiff(
     inHunk = false;
   };
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? "";
+  for (const line of iterateDiffLines(diff)) {
     if (line.startsWith("diff --git ")) {
       finishHunk();
       fileCount += 1;
@@ -78,7 +90,15 @@ export function parseAndValidateDiff(
     }
     if (line.startsWith("+++ ")) {
       current.destination = parseDestination(line.slice(4));
-      if (current.destination) representedPaths.push(current.destination);
+      if (current.destination) {
+        if (representedPaths.length >= LIMITS.maxPathsPerPr) {
+          throw new AppError(
+            "GITHUB_RESPONSE_LIMIT",
+            "PR 경로 수 한도를 초과했습니다",
+          );
+        }
+        representedPaths.push(current.destination);
+      }
       continue;
     }
     if (
@@ -110,13 +130,31 @@ export function parseAndValidateDiff(
     if (marker === "+") {
       newRemaining -= 1;
       rawAdditions += 1;
+      if (rawAdditions > LIMITS.maxRawAdditionsPerPr) {
+        throw new AppError(
+          "GITHUB_RESPONSE_LIMIT",
+          "PR 원시 추가 줄 한도를 초과했습니다",
+        );
+      }
       if (current.destination && isEligiblePath(current.destination)) {
         const normalized = normalizeLine(line.slice(1));
-        if (normalized)
+        if (normalized) {
+          const bytes = Buffer.byteLength(normalized, "utf8");
+          if (
+            eligibleAdditions.length >= LIMITS.maxEligibleAdditionsPerPr ||
+            eligibleBytes + bytes > LIMITS.eligibleAdditionBytesPerPr
+          ) {
+            throw new AppError(
+              "GITHUB_RESPONSE_LIMIT",
+              "PR 적격 추가 줄 한도를 초과했습니다",
+            );
+          }
+          eligibleBytes += bytes;
           eligibleAdditions.push({
             path: current.destination,
             line: normalized,
           });
+        }
       }
     } else if (marker === "-") {
       oldRemaining -= 1;
@@ -150,26 +188,9 @@ export function parseAndValidateDiff(
       "GitHub 메타데이터와 diff 원시 집계가 일치하지 않습니다",
     );
   }
-  if (rawAdditions > LIMITS.maxRawAdditionsPerPr) {
-    throw new AppError(
-      "GITHUB_RESPONSE_LIMIT",
-      "PR 원시 추가 줄 한도를 초과했습니다",
-    );
-  }
-  if (representedPaths.length > LIMITS.maxPathsPerPr) {
-    throw new AppError(
-      "GITHUB_RESPONSE_LIMIT",
-      "PR 경로 수 한도를 초과했습니다",
-    );
-  }
-  if (eligibleAdditions.length > LIMITS.maxEligibleAdditionsPerPr) {
-    throw new AppError(
-      "GITHUB_RESPONSE_LIMIT",
-      "PR 적격 추가 줄 한도를 초과했습니다",
-    );
-  }
   return {
     rawAdditions,
+    eligibleBytes,
     changedFiles: fileCount,
     eligibleAdditions,
     representedPaths,

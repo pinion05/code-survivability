@@ -69,6 +69,12 @@ test("submits a username, polls status, and renders evidence-rich results", asyn
   await expect(
     page.getByRole("heading", { name: "@pinion05의 코드 생존 기록" }),
   ).toBeVisible();
+  await expect(page.getByRole("note")).toContainText(
+    "집계 범위 · 선택·분석된 PR 2개",
+  );
+  await expect(page.getByRole("note")).toContainText(
+    "선택된 2개 PR을 모두 분석한 결과",
+  );
   const metrics = page.locator(".metrics-grid");
   await expect(metrics.getByText("78.0%", { exact: true })).toHaveCount(2);
   await expect(metrics.getByText("91.0%", { exact: true })).toBeVisible();
