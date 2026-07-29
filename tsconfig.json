@@ -1,0 +1,19 @@
+{
+  "extends": "astro/tsconfigs/strictest",
+  "compilerOptions": {
+    "allowJs": false,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "types": ["node", "bun"],
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] }
+  },
+  "include": [
+    ".astro/types.d.ts",
+    "src/**/*",
+    "tests/**/*",
+    "playwright.config.ts"
+  ]
+}

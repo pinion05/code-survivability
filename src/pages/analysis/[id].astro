@@ -1,0 +1,25 @@
+---
+import AnalysisProgress from "../../components/AnalysisProgress";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+
+export const prerender = false;
+const { id } = Astro.params;
+if (!id || !/^[0-9a-f-]{36}$/i.test(id)) Astro.response.status = 404;
+---
+
+<BaseLayout title="분석 중 — Code Survivability">
+  {
+    id && /^[0-9a-f-]{36}$/i.test(id) ? (
+      <AnalysisProgress id={id} client:load />
+    ) : (
+      <div class="shell">
+        <section class="panel progress-panel error-panel">
+          <>
+            <h1 class="progress-title">분석을 찾을 수 없습니다</h1>
+            <p class="progress-copy">주소가 만료되었거나 올바르지 않습니다.</p>
+          </>
+        </section>
+      </div>
+    )
+  }
+</BaseLayout>

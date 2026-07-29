@@ -1,0 +1,41 @@
+---
+import Dashboard from "../../components/Dashboard";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import { runtime } from "../../server/runtime";
+
+export const prerender = false;
+const { id } = Astro.params;
+const valid = Boolean(id && /^[0-9a-f-]{36}$/i.test(id));
+const result = valid && id ? runtime.jobs.getResult(id) : null;
+if (!result) Astro.response.status = 404;
+---
+
+<BaseLayout
+  title={result
+    ? `@${result.canonicalLogin}의 코드 생존 기록`
+    : "분석을 찾을 수 없습니다"}
+>
+  {
+    result ? (
+      <Dashboard result={result} shareMode={true} client:load />
+    ) : (
+      <div class="shell">
+        <section class="panel progress-panel error-panel">
+          <>
+            <h1 class="progress-title">분석을 찾을 수 없습니다</h1>
+            <p class="progress-copy">
+              결과가 만료되었거나, 제거되었거나, 서버가 다시 시작되었습니다.
+            </p>
+            <a
+              class="primary-button"
+              href="/"
+              style="display:inline-flex;align-items:center;text-decoration:none;margin-top:18px"
+            >
+              새 분석 시작
+            </a>
+          </>
+        </section>
+      </div>
+    )
+  }
+</BaseLayout>

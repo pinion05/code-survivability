@@ -1,0 +1,69 @@
+---
+import UsernameForm from "../components/UsernameForm";
+import BaseLayout from "../layouts/BaseLayout.astro";
+---
+
+<BaseLayout>
+  <section class="shell hero">
+    <span class="eyebrow">Evidence, not vibes</span>
+    <h1>당신이 만든 코드는<br /><span>지금도 살아 있나요?</span></h1>
+    <p class="hero-copy">
+      공개 GitHub PR로 추가한 줄을 현재 기본 브랜치와 비교합니다. 이동, 텍스트
+      발생, blame 계보를 분리해 과장 없이 보여드립니다.
+    </p>
+    <UsernameForm client:load />
+    <div class="proof-strip" aria-label="분석 원칙">
+      <div class="proof">
+        <strong>공개 데이터만</strong><span
+          >비공개 저장소와 권한은 요청하지 않음</span
+        >
+      </div>
+      <div class="proof">
+        <strong>최대 30개 PR</strong><span>최근 24개월, 범위 제한을 명시</span>
+      </div>
+      <div class="proof">
+        <strong>부분 점수 없음</strong><span
+          >증거가 불완전하면 확인 불가로 표시</span
+        >
+      </div>
+    </div>
+  </section>
+
+  <section class="shell section" aria-labelledby="how-title">
+    <div class="section-heading">
+      <small>THREE INDEPENDENT SIGNALS</small>
+      <h2 id="how-title">
+        하나의 그럴듯한 점수 대신,<br />세 가지 근거를 따로 봅니다.
+      </h2>
+      <p>
+        같은 텍스트가 남아 있는 것과 내 PR의 계보가 남아 있는 것은 다릅니다.
+        중복 줄도 실제 발생 횟수만큼만 계산합니다.
+      </p>
+    </div>
+    <div class="method-grid">
+      <article class="method-card">
+        <span class="method-number">01</span><h3>원래 경로</h3><p>
+          PR이 추가한 목적지 경로에서 정규화된 줄이 현재도 정확히 몇 번
+          나타나는지 확인합니다. 다른 경로의 같은 텍스트는 대신 셀 수 없습니다.
+        </p>
+      </article>
+      <article class="method-card">
+        <span class="method-number">02</span><h3>저장소 전체 텍스트</h3><p>
+          현재 트리 어디엔가 같은 텍스트가 남아 있는지 봅니다. 이동 가능성을
+          보여주지만 출처나 저작권의 증거는 아닙니다.
+        </p>
+      </article>
+      <article class="method-card">
+        <span class="method-number">03</span><h3>Blame 계보</h3><p>
+          선택된 실제 줄의 blame OID가 PR 병합 SHA 또는 PR 커밋 SHA와 정확히
+          일치할 때만 계보로 인정합니다.
+        </p>
+      </article>
+    </div>
+    <div class="notice">
+      분석은 저장소 코드를 체크아웃하거나 실행하지 않습니다. 기본 브랜치의 공개
+      Git 객체를 제한적으로 읽으며, 불완전한 tree·blob·blame 결과를 0점으로
+      바꾸지 않습니다.
+    </div>
+  </section>
+</BaseLayout>

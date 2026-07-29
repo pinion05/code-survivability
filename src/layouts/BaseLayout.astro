@@ -1,0 +1,37 @@
+---
+import "../styles.css";
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+const {
+  title = "Code Survivability — 코드가 지금도 살아 있는지 확인하세요",
+  description = "GitHub PR로 추가한 코드가 현재 공개 저장소에 얼마나 남아 있는지 투명하게 분석합니다.",
+} = Astro.props;
+---
+
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#070b12" />
+    <title>{title}</title>
+  </head>
+  <body>
+    <header class="shell site-header">
+      <a class="brand" href="/" aria-label="Code Survivability 홈">
+        <span class="brand-mark" aria-hidden="true">⌁</span>
+        <span>Code Survivability</span>
+      </a>
+      <span class="header-note">Public GitHub evidence · line-v1</span>
+    </header>
+    <main><slot /></main>
+    <footer class="shell site-footer">
+      <span>공개 저장소의 제한된 증거만 분석합니다.</span>
+      <span>텍스트 일치는 코드 출처를 뜻하지 않습니다.</span>
+    </footer>
+  </body>
+</html>
